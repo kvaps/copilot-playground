@@ -4,19 +4,21 @@ import (
 	"flag"
 	"os"
 
-	"nat-controller/controllers"
-
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	corev1 "k8s.io/api/core/v1"
+	"nat-controller/controllers"
+
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/google/nftables"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
 var (
@@ -51,6 +53,7 @@ func main() {
 	cfg := mgr.GetConfig()
 	cfg.GroupVersion = &corev1.SchemeGroupVersion
 	cfg.APIPath = "/api"
+
 	cfg.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{
 		CodecFactory: serializer.NewCodecFactory(scheme),
 	}
@@ -61,8 +64,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	nftConn := &nftables.Conn{}
+
 	controller := controllers.EndpointsController{
 		RESTClient: restClient,
+		NFTConn:    nftConn,
 	}
 
 	if err := mgr.Add(controller); err != nil {
