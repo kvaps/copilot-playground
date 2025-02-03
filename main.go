@@ -2,26 +2,23 @@ package main
 
 import (
 	"flag"
-	"fmt"
-	"net"
 	"os"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
+	// Импорт всех плагинов авторизации для Kubernetes
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	"vmi-router/controllers"
+	"nat-controller/controllers"
 
-	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	virtv1 "kubevirt.io/api/core/v1"
-	"kubevirt.io/client-go/kubecli"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
 
 var (
@@ -31,26 +28,10 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(ciliumv2.AddToScheme(scheme))
-	utilruntime.Must(virtv1.AddToScheme(scheme))
-}
-
-type cidrFlag []string
-
-func (f *cidrFlag) String() string { return "" }
-func (f *cidrFlag) Set(s string) error {
-	*f = append(*f, s)
-	return nil
 }
 
 func main() {
-	var cidrs cidrFlag
-	var dryRun bool
-	var metricsAddr string
 	var probeAddr string
-	flag.Var(&cidrs, "cidr", "CIDRs enabled to route (multiple flags allowed)")
-	flag.BoolVar(&dryRun, "dry-run", false, "Don't perform any changes on the node.")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":0", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":0", "The address the probe endpoint binds to.")
 	opts := zap.Options{
 		Development: true,
@@ -60,22 +41,8 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	var parsedCIDRs []*net.IPNet
-	for _, cidr := range cidrs {
-		_, parsedCIDR, err := net.ParseCIDR(cidr)
-		if err != nil || parsedCIDR == nil {
-			fmt.Println(err, "failed to parse CIDR")
-			os.Exit(1)
-		}
-		parsedCIDRs = append(parsedCIDRs, parsedCIDR)
-	}
-
-	log.Info(fmt.Sprintf("managed CIDRs: %+v", cidrs))
-
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		Port:                   9443,
 		HealthProbeBindAddress: probeAddr,
 	})
 	if err != nil {
@@ -83,33 +50,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientSet, err := kubecli.GetKubevirtClientFromRESTConfig(mgr.GetConfig())
+	cfg := mgr.GetConfig()
+	cfg.GroupVersion = &corev1.SchemeGroupVersion
+	cfg.APIPath = "/api"
+
+	cfg.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{
+		CodecFactory: serializer.NewCodecFactory(scheme),
+	}
+
+	restClient, err := rest.RESTClientFor(cfg)
 	if err != nil {
-		log.Error(err, "unable to create clientset")
+		log.Error(err, "failed to create rest client")
 		os.Exit(1)
 	}
 
-	controller := controllers.VMIRouterController{
-		RESTClient:        clientSet.RestClient(),
-		Client:            mgr.GetClient(),
-		CIDRs:             parsedCIDRs,
-		RouteGet:          netlink.RouteGet,
-		RouteDel:          netlink.RouteDel,
-		RouteReplace:      netlink.RouteReplace,
-		RuleAdd:           netlink.RuleAdd,
-		RuleDel:           netlink.RuleDel,
-		RuleListFiltered:  netlink.RuleListFiltered,
-		RouteListFiltered: netlink.RouteListFiltered,
-	}
-	if dryRun {
-		controller.RuleAdd = func(*netlink.Rule) error { return nil }
-		controller.RuleDel = func(*netlink.Rule) error { return nil }
-		controller.RouteDel = func(*netlink.Route) error { return nil }
-		controller.RouteReplace = func(*netlink.Route) error { return nil }
+	controller := controllers.EndpointsController{
+		RESTClient: restClient,
 	}
 
 	if err := mgr.Add(controller); err != nil {
-		log.Error(err, "unable to add vmi router controller to manager")
+		log.Error(err, "unable to add endpoints controller to manager")
 		os.Exit(1)
 	}
 
