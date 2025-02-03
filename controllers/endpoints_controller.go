@@ -7,9 +7,10 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -24,7 +25,7 @@ type ServiceEndpoints struct {
 }
 
 type ServicesController struct {
-	RESTClient   *rest.RESTClient
+	Clientset    *kubernetes.Clientset
 	ServiceMap   map[string]*ServiceEndpoints
 	ServiceMutex sync.Mutex
 }
@@ -35,7 +36,7 @@ func (c ServicesController) Start(ctx context.Context) error {
 	c.ServiceMap = make(map[string]*ServiceEndpoints)
 
 	// Create informer for services
-	serviceLW := cache.NewListWatchFromClient(c.RESTClient, "services", v1.NamespaceAll, fields.Everything())
+	serviceLW := cache.NewListWatchFromClient(c.Clientset.CoreV1().RESTClient(), "services", v1.NamespaceAll, fields.Everything())
 	serviceInformer := cache.NewSharedIndexInformer(
 		serviceLW,
 		&v1.Service{},
@@ -73,7 +74,7 @@ func (c ServicesController) Start(ctx context.Context) error {
 	log.Info("services synchronization completed")
 
 	// Start loading endpoints after services are fully loaded
-	endpointsLW := cache.NewListWatchFromClient(c.RESTClient, "endpoints", v1.NamespaceAll, fields.Everything())
+	endpointsLW := cache.NewListWatchFromClient(c.Clientset.CoreV1().RESTClient(), "endpoints", v1.NamespaceAll, fields.Everything())
 	endpointsInformer := cache.NewSharedIndexInformer(
 		endpointsLW,
 		&v1.Endpoints{},
@@ -127,8 +128,20 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 		c.ServiceMutex.Lock()
 		defer c.ServiceMutex.Unlock()
 		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+
+		// Fetch the corresponding endpoint if it exists
+		ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+		if err == nil {
+			c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+		}
 	}
 	fmt.Println("add service", svc.GetNamespace(), svc.GetName())
+	// TODO
+	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 func (c *ServicesController) deleteServiceFunc(obj interface{}) {
@@ -141,6 +154,12 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 	defer c.ServiceMutex.Unlock()
 	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
 	fmt.Println("delete service", svc.GetNamespace(), svc.GetName())
+	// TODO
+	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
@@ -156,15 +175,24 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 			se.Service = svc
 		} else {
 			c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
-		}
-		// Check if there is already an endpoint for this service
-		if ep, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists && ep.Endpoint != nil {
-			c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep.Endpoint
+
+			// Fetch the corresponding endpoint if it exists
+			ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+			if err == nil {
+				c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+			}
 		}
 	} else {
 		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
 	}
 	fmt.Println("update service", svc.GetNamespace(), svc.GetName())
+
+	// TODO
+	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 func (c *ServicesController) addEndpointFunc(obj interface{}) {
@@ -181,6 +209,12 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
 	}
 	fmt.Println("add endpoint", ep.GetNamespace(), ep.GetName())
+	// TODO
+	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
@@ -195,6 +229,12 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 		c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
 	}
 	fmt.Println("delete endpoint", ep.GetNamespace(), ep.GetName())
+	// TODO
+	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
@@ -211,6 +251,12 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
 	}
 	fmt.Println("update endpoint", ep.GetNamespace(), ep.GetName())
+	// TODO
+	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
+		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
+			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+		}
+	}
 }
 
 // Placeholder for cleanupRemovedServices

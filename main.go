@@ -11,13 +11,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -57,16 +57,16 @@ func main() {
 		CodecFactory: serializer.NewCodecFactory(scheme),
 	}
 
-	restClient, err := rest.RESTClientFor(cfg)
+	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		log.Error(err, "failed to create rest client")
+		log.Error(err, "failed to create clientset")
 		os.Exit(1)
 	}
 
 	//nftConn := &nftables.Conn{}
 
 	controller := controllers.ServicesController{
-		RESTClient: restClient,
+		Clientset: clientset,
 		//NFTConn:    nftConn,
 	}
 
