@@ -3,8 +3,11 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"log"
+	"net"
 	"time"
 
+	"github.com/google/nftables"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -13,16 +16,14 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-var (
-	log = ctrl.Log.WithName("ep-controller")
-)
-
 type EndpointsController struct {
 	RESTClient *rest.RESTClient
+	nftConn    *nftables.Conn
 }
 
 func (c EndpointsController) Start(ctx context.Context) error {
-	log.Info("starting vmi routes controller")
+	log := ctrl.Log.WithName("ep-controller")
+	log.Info("starting endpoints controller")
 
 	lw := cache.NewListWatchFromClient(c.RESTClient, "endpoints", v1.NamespaceAll, fields.Everything())
 	informer := cache.NewSharedIndexInformer(
@@ -50,25 +51,24 @@ func (c EndpointsController) Start(ctx context.Context) error {
 	defer close(stopper)
 	defer utilruntime.HandleCrash()
 	go informer.Run(stopper)
-	log.Info("syncronizing")
+	log.Info("synchronizing")
 
-	//syncronize the cache before starting to process
 	if !cache.WaitForCacheSync(stopper, informer.HasSynced) {
 		utilruntime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
-		log.Info("syncronization failed")
-		return fmt.Errorf("syncronization failed")
+		log.Info("synchronization failed")
+		return fmt.Errorf("synchronization failed")
 	}
-	log.Info("syncronization completed")
+	log.Info("synchronization completed")
 
 	log.Info("create chains")
-	//if err := c.setupNFTChains(); err != nil {
-	//	return fmt.Errorf("failed to create chains: %w", err)
-	//}
+	if err := c.setupNFTChains(); err != nil {
+		return fmt.Errorf("failed to create chains: %w", err)
+	}
 
 	log.Info("running cleanup for removed services")
-	//if err := c.cleanupRemovedServices(informer); err != nil {
-	//	return fmt.Errorf("failed to cleanup removed services: %w", err)
-	//}
+	if err := c.cleanupRemovedServices(informer); err != nil {
+		return fmt.Errorf("failed to cleanup removed services: %w", err)
+	}
 	log.Info("cleanup of removed services completed")
 
 	<-ctx.Done()
@@ -80,25 +80,106 @@ func (c EndpointsController) Start(ctx context.Context) error {
 func (c EndpointsController) addFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
-		// object is not Endpoints
 		return
 	}
 	fmt.Println("add", ep.GetNamespace(), ep.GetName())
+	c.updateNftablesRules(ep)
 }
+
 func (c EndpointsController) deleteFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
-		// object is not Endpoints
 		return
 	}
 	fmt.Println("del", ep.GetNamespace(), ep.GetName())
+	c.removeNftablesRules(ep)
 }
 
 func (c EndpointsController) updateFunc(oldObj, newObj interface{}) {
 	ep, ok := newObj.(*v1.Endpoints)
 	if !ok {
-		// object is not Endpoints
 		return
 	}
 	fmt.Println("update", ep.GetNamespace(), ep.GetName())
+	c.updateNftablesRules(ep)
+}
+
+func (c EndpointsController) setupNFTChains() error {
+	// Initialize nftables connection
+	c.nftConn = &nftables.Conn{}
+
+	// Load initial nftables configuration here
+	// Example: Create necessary tables, sets, chains, and rules
+
+	return nil
+}
+
+func (c EndpointsController) cleanupRemovedServices(informer cache.SharedIndexInformer) error {
+	// Logic to cleanup removed services
+	// Example: Iterate over cached items and clean up nftables rules for non-existent services
+
+	for _, obj := range informer.GetStore().List() {
+		ep, ok := obj.(*v1.Endpoints)
+		if !ok {
+			continue
+		}
+		// Check if the endpoint still exists in the cluster
+		if !c.endpointExists(ep) {
+			c.removeNftablesRules(ep)
+		}
+	}
+
+	return nil
+}
+
+func (c EndpointsController) endpointExists(ep *v1.Endpoints) bool {
+	// Logic to check if the endpoint still exists in the cluster
+	// Example: Query the Kubernetes API to verify the existence of the endpoint
+	return true
+}
+
+func (c EndpointsController) updateNftablesRules(ep *v1.Endpoints) {
+	// Implement logic to add/update nftables rules here
+	// Example: add IP to set
+	for _, subset := range ep.Subsets {
+		for _, addr := range subset.Addresses {
+			c.addIPToSet(addr.IP)
+		}
+	}
+}
+
+func (c EndpointsController) removeNftablesRules(ep *v1.Endpoints) {
+	// Implement logic to remove nftables rules here
+	// Example: remove IP from set
+	for _, subset := range ep.Subsets {
+		for _, addr := range subset.Addresses {
+			c.removeIPFromSet(addr.IP)
+		}
+	}
+}
+
+func (c EndpointsController) addIPToSet(ip string) {
+	// Example logic to add IP to nftables set
+	podIP := net.ParseIP(ip).To4()
+	err := c.nftConn.SetAddElements(&nftables.Set{
+		Table:   &nftables.Table{Name: "raw"},
+		Name:    "wholeip_pods",
+		KeyType: nftables.TypeIPAddr,
+	}, []nftables.SetElement{{Key: podIP}})
+	if err != nil {
+		log.Fatalf("could not add IP to set: %v", err)
+	}
+}
+
+func (c EndpointsController) removeIPFromSet(ip string) {
+	// Example logic to remove IP from nftables set
+	podIP := net.ParseIP(ip).To4()
+	err := c.nftConn.SetDeleteElements(&nftables.Set{
+		Table:   &nftables.Table{Name: "raw"},
+		Name:    "wholeip_pods",
+		KeyType: nftables.TypeIPAddr,
+	}, []nftables.SetElement{{Key: podIP}})
+	if err != nil {
+		log.Fatalf("could not remove IP from set: %v", err)
+	}
 }
