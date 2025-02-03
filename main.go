@@ -16,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/google/nftables"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 )
@@ -64,11 +63,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	nftConn := &nftables.Conn{}
+	//nftConn := &nftables.Conn{}
 
-	controller := controllers.EndpointsController{
+	controller := controllers.ServicesController{
 		RESTClient: restClient,
-		NFTConn:    nftConn,
+		//NFTConn:    nftConn,
 	}
 
 	if err := mgr.Add(controller); err != nil {

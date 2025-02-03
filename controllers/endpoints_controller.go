@@ -3,13 +3,9 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"log"
-	"net"
+	"sync"
 	"time"
 
-	"github.com/google/nftables"
-	"github.com/google/nftables/expr"
-	"golang.org/x/sys/unix"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -18,18 +14,68 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-type EndpointsController struct {
-	RESTClient *rest.RESTClient
-	NFTConn    *nftables.Conn
+var (
+	log = ctrl.Log.WithName("svc-controller")
+)
+
+type ServiceEndpoints struct {
+	Service  *v1.Service
+	Endpoint *v1.Endpoints
 }
 
-func (c EndpointsController) Start(ctx context.Context) error {
-	log := ctrl.Log.WithName("ep-controller")
-	log.Info("starting endpoints controller")
+type ServicesController struct {
+	RESTClient   *rest.RESTClient
+	ServiceMap   map[string]*ServiceEndpoints
+	ServiceMutex sync.Mutex
+}
 
-	lw := cache.NewListWatchFromClient(c.RESTClient, "endpoints", v1.NamespaceAll, fields.Everything())
-	informer := cache.NewSharedIndexInformer(
-		lw,
+func (c ServicesController) Start(ctx context.Context) error {
+	log.Info("starting services controller")
+
+	c.ServiceMap = make(map[string]*ServiceEndpoints)
+
+	// Create informer for services
+	serviceLW := cache.NewListWatchFromClient(c.RESTClient, "services", v1.NamespaceAll, fields.Everything())
+	serviceInformer := cache.NewSharedIndexInformer(
+		serviceLW,
+		&v1.Service{},
+		12*time.Hour,
+		cache.Indexers{
+			"namespace_name": func(obj interface{}) ([]string, error) {
+				svc, ok := obj.(*v1.Service)
+				if !ok {
+					return nil, fmt.Errorf("object is not *v1.Service")
+				}
+				return []string{svc.Namespace + "/" + svc.Name}, nil
+			},
+		},
+	)
+
+	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addServiceFunc,
+		DeleteFunc: c.deleteServiceFunc,
+		UpdateFunc: c.updateServiceFunc,
+	})
+
+	stopper := make(chan struct{})
+	defer close(stopper)
+	defer utilruntime.HandleCrash()
+
+	// Start service informer and wait for its cache to sync
+	go serviceInformer.Run(stopper)
+	log.Info("synchronizing services")
+
+	if !cache.WaitForCacheSync(stopper, serviceInformer.HasSynced) {
+		utilruntime.HandleError(fmt.Errorf("Timed out waiting for services cache to sync"))
+		log.Info("synchronization of services failed")
+		return fmt.Errorf("synchronization of services failed")
+	}
+	log.Info("services synchronization completed")
+
+	// Start loading endpoints after services are fully loaded
+	endpointsLW := cache.NewListWatchFromClient(c.RESTClient, "endpoints", v1.NamespaceAll, fields.Everything())
+	endpointsInformer := cache.NewSharedIndexInformer(
+		endpointsLW,
 		&v1.Endpoints{},
 		12*time.Hour,
 		cache.Indexers{
@@ -43,329 +89,132 @@ func (c EndpointsController) Start(ctx context.Context) error {
 		},
 	)
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addFunc,
-		DeleteFunc: c.deleteFunc,
-		UpdateFunc: c.updateFunc,
+	endpointsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addEndpointFunc,
+		DeleteFunc: c.deleteEndpointFunc,
+		UpdateFunc: c.updateEndpointFunc,
 	})
 
-	stopper := make(chan struct{})
-	defer close(stopper)
-	defer utilruntime.HandleCrash()
-	go informer.Run(stopper)
-	log.Info("synchronizing")
+	go endpointsInformer.Run(stopper)
+	log.Info("synchronizing endpoints")
 
-	if !cache.WaitForCacheSync(stopper, informer.HasSynced) {
-		utilruntime.HandleError(fmt.Errorf("Timed out waiting for caches to sync"))
-		log.Info("synchronization failed")
-		return fmt.Errorf("synchronization failed")
+	if !cache.WaitForCacheSync(stopper, endpointsInformer.HasSynced) {
+		utilruntime.HandleError(fmt.Errorf("Timed out waiting for endpoints cache to sync"))
+		log.Info("synchronization of endpoints failed")
+		return fmt.Errorf("synchronization of endpoints failed")
 	}
-	log.Info("synchronization completed")
-
-	log.Info("create chains")
-	if err := c.setupNFTChains(); err != nil {
-		return fmt.Errorf("failed to create chains: %w", err)
-	}
+	log.Info("endpoints synchronization completed")
 
 	log.Info("running cleanup for removed services")
-	if err := c.cleanupRemovedServices(informer); err != nil {
+	if err := c.cleanupRemovedServices(); err != nil {
 		return fmt.Errorf("failed to cleanup removed services: %w", err)
 	}
 	log.Info("cleanup of removed services completed")
 
 	<-ctx.Done()
-	log.Info("shutting down endpoints controller")
+	log.Info("shutting down services controller")
 
 	return nil
 }
 
-func (c EndpointsController) addFunc(obj interface{}) {
-	ep, ok := obj.(*v1.Endpoints)
+func (c *ServicesController) addServiceFunc(obj interface{}) {
+	svc, ok := obj.(*v1.Service)
 	if !ok {
+		// object is not Service
 		return
 	}
-	fmt.Println("add", ep.GetNamespace(), ep.GetName())
-	c.updateNftablesRules(ep)
+	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; ok && val == "true" {
+		c.ServiceMutex.Lock()
+		defer c.ServiceMutex.Unlock()
+		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+	}
+	fmt.Println("add service", svc.GetNamespace(), svc.GetName())
 }
 
-func (c EndpointsController) deleteFunc(obj interface{}) {
-	ep, ok := obj.(*v1.Endpoints)
+func (c *ServicesController) deleteServiceFunc(obj interface{}) {
+	svc, ok := obj.(*v1.Service)
 	if !ok {
+		// object is not Service
 		return
 	}
-	fmt.Println("del", ep.GetNamespace(), ep.GetName())
-	c.removeNftablesRules(ep)
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
+	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+	fmt.Println("delete service", svc.GetNamespace(), svc.GetName())
 }
 
-func (c EndpointsController) updateFunc(oldObj, newObj interface{}) {
+func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
+	svc, ok := newObj.(*v1.Service)
+	if !ok {
+		// object is not Service
+		return
+	}
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
+	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; ok && val == "true" {
+		if se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
+			se.Service = svc
+		} else {
+			c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+		}
+		// Check if there is already an endpoint for this service
+		if ep, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists && ep.Endpoint != nil {
+			c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep.Endpoint
+		}
+	} else {
+		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+	}
+	fmt.Println("update service", svc.GetNamespace(), svc.GetName())
+}
+
+func (c *ServicesController) addEndpointFunc(obj interface{}) {
+	ep, ok := obj.(*v1.Endpoints)
+	if !ok {
+		// object is not Endpoints
+		return
+	}
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
+	if se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
+		se.Endpoint = ep
+	} else {
+		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
+	}
+	fmt.Println("add endpoint", ep.GetNamespace(), ep.GetName())
+}
+
+func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
+	ep, ok := obj.(*v1.Endpoints)
+	if !ok {
+		// object is not Endpoints
+		return
+	}
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
+	if _, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
+		c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
+	}
+	fmt.Println("delete endpoint", ep.GetNamespace(), ep.GetName())
+}
+
+func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	ep, ok := newObj.(*v1.Endpoints)
 	if !ok {
+		// object is not Endpoints
 		return
 	}
-	fmt.Println("update", ep.GetNamespace(), ep.GetName())
-	c.updateNftablesRules(ep)
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
+	if se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
+		se.Endpoint = ep
+	} else {
+		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
+	}
+	fmt.Println("update endpoint", ep.GetNamespace(), ep.GetName())
 }
 
-func (c EndpointsController) setupNFTChains() error {
-	// Initialize nftables connection
-	c.NFTConn = &nftables.Conn{}
-
-	// Flush all tables first
-	c.NFTConn.FlushRuleset()
-
-	// Create raw table
-	rawTable := c.NFTConn.AddTable(&nftables.Table{
-		Family: nftables.TableFamilyIPv4,
-		Name:   "raw",
-	})
-
-	// Create wholeip_pods set
-	podsSet := &nftables.Set{
-		Table:   rawTable,
-		Name:    "wholeip_pods",
-		KeyType: nftables.TypeIPAddr,
-	}
-	if err := c.NFTConn.AddSet(podsSet, nil); err != nil {
-		return fmt.Errorf("could not add pods set: %w", err)
-	}
-
-	// Create wholeip_svcs set
-	svcsSet := &nftables.Set{
-		Table:   rawTable,
-		Name:    "wholeip_svcs",
-		KeyType: nftables.TypeIPAddr,
-	}
-	if err := c.NFTConn.AddSet(svcsSet, nil); err != nil {
-		return fmt.Errorf("could not add services set: %w", err)
-	}
-
-	// Create prerouting chain in raw table
-	preroutingRaw := c.NFTConn.AddChain(&nftables.Chain{
-		Name:     "prerouting",
-		Table:    rawTable,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRaw,
-	})
-
-	// Add rules to raw prerouting chain for source address
-	c.NFTConn.AddRule(&nftables.Rule{
-		Table: rawTable,
-		Chain: preroutingRaw,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       12,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				SetName:        "wholeip_pods",
-				SetID:          podsSet.ID,
-			},
-			&expr.Notrack{},
-			&expr.Verdict{
-				Kind: expr.VerdictReturn,
-			},
-		},
-	})
-
-	// Add rules to raw prerouting chain for destination address
-	c.NFTConn.AddRule(&nftables.Rule{
-		Table: rawTable,
-		Chain: preroutingRaw,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       16,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				SetName:        "wholeip_svcs",
-				SetID:          svcsSet.ID,
-			},
-			&expr.Notrack{},
-			&expr.Verdict{
-				Kind: expr.VerdictReturn,
-			},
-		},
-	})
-
-	// Create route table
-	routeTable := c.NFTConn.AddTable(&nftables.Table{
-		Family: nftables.TableFamilyIPv4,
-		Name:   "route",
-	})
-
-	// Create wholeip_snat map
-	snatMap := &nftables.Set{
-		Table:    routeTable,
-		Name:     "wholeip_snat",
-		KeyType:  nftables.TypeIPAddr,
-		DataType: nftables.TypeIPAddr,
-		IsMap:    true,
-	}
-	if err := c.NFTConn.AddSet(snatMap, nil); err != nil {
-		return fmt.Errorf("could not add SNAT map: %w", err)
-	}
-
-	// Create wholeip_dnat map
-	dnatMap := &nftables.Set{
-		Table:    routeTable,
-		Name:     "wholeip_dnat",
-		KeyType:  nftables.TypeIPAddr,
-		DataType: nftables.TypeIPAddr,
-		IsMap:    true,
-	}
-	if err := c.NFTConn.AddSet(dnatMap, nil); err != nil {
-		return fmt.Errorf("could not add DNAT map: %w", err)
-	}
-
-	// Create output chain in route table
-	output := c.NFTConn.AddChain(&nftables.Chain{
-		Name:     "output",
-		Table:    routeTable,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPostrouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource + 1),
-	})
-
-	// Create prerouting chain in route table
-	preroutingRoute := c.NFTConn.AddChain(&nftables.Chain{
-		Name:     "prerouting",
-		Table:    routeTable,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
-	})
-
-	// Add SNAT rule
-	c.NFTConn.AddRule(&nftables.Rule{
-		Table: routeTable,
-		Chain: output,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       12,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				DestRegister:   1,
-				SetName:        "wholeip_snat",
-				SetID:          snatMap.ID,
-				IsDestRegSet:   true,
-			},
-			&expr.Payload{
-				OperationType:  expr.PayloadWrite,
-				SourceRegister: 1,
-				Base:           expr.PayloadBaseNetworkHeader,
-				Offset:         12,
-				Len:            4,
-				CsumType:       expr.CsumTypeInet,
-				CsumOffset:     10,
-				CsumFlags:      unix.NFT_PAYLOAD_L4CSUM_PSEUDOHDR,
-			},
-		},
-	})
-
-	// Add DNAT rule
-	c.NFTConn.AddRule(&nftables.Rule{
-		Table: routeTable,
-		Chain: preroutingRoute,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       16,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				DestRegister:   1,
-				SetName:        "wholeip_dnat",
-				SetID:          dnatMap.ID,
-				IsDestRegSet:   true,
-			},
-			&expr.Payload{
-				OperationType:  expr.PayloadWrite,
-				SourceRegister: 1,
-				Base:           expr.PayloadBaseNetworkHeader,
-				Offset:         16,
-				Len:            4,
-				CsumType:       expr.CsumTypeInet,
-				CsumOffset:     10,
-				CsumFlags:      unix.NFT_PAYLOAD_L4CSUM_PSEUDOHDR,
-			},
-		},
-	})
-
-	// Commit the changes
-	if err := c.NFTConn.Flush(); err != nil {
-		return fmt.Errorf("failed to commit changes: %w", err)
-	}
-
+// Placeholder for cleanupRemovedServices
+func (c *ServicesController) cleanupRemovedServices() error {
+	// Placeholder logic for removing services not in the map
 	return nil
-}
-
-func (c EndpointsController) cleanupRemovedServices(informer cache.SharedIndexInformer) error {
-	for _, obj := range informer.GetStore().List() {
-		ep, ok := obj.(*v1.Endpoints)
-		if !ok {
-			continue
-		}
-		if !c.endpointExists(ep) {
-			c.removeNftablesRules(ep)
-		}
-	}
-
-	return nil
-}
-
-func (c EndpointsController) endpointExists(ep *v1.Endpoints) bool {
-	return true
-}
-
-func (c EndpointsController) updateNftablesRules(ep *v1.Endpoints) {
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			c.addIPToSet(addr.IP)
-		}
-	}
-}
-
-func (c EndpointsController) removeNftablesRules(ep *v1.Endpoints) {
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			c.removeIPFromSet(addr.IP)
-		}
-	}
-}
-
-func (c EndpointsController) addIPToSet(ip string) {
-	podIP := net.ParseIP(ip).To4()
-	err := c.NFTConn.SetAddElements(&nftables.Set{
-		Table:   &nftables.Table{Name: "raw"},
-		Name:    "wholeip_pods",
-		KeyType: nftables.TypeIPAddr,
-	}, []nftables.SetElement{{Key: podIP}})
-	if err != nil {
-		log.Fatalf("could not add IP to set: %v", err)
-	}
-}
-
-func (c EndpointsController) removeIPFromSet(ip string) {
-	podIP := net.ParseIP(ip).To4()
-	err := c.NFTConn.SetDeleteElements(&nftables.Set{
-		Table:   &nftables.Table{Name: "raw"},
-		Name:    "wholeip_pods",
-		KeyType: nftables.TypeIPAddr,
-	}, []nftables.SetElement{{Key: podIP}})
-	if err != nil {
-		log.Fatalf("could not remove IP from set: %v", err)
-	}
 }
