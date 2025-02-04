@@ -345,6 +345,23 @@ func hasWholeIPAnnotation(svc *v1.Service) bool {
 }
 
 func (c *NATController) cleanupRemovedServices() error {
-	// Placeholder logic for removing services not in the map
+	keepMap := make(map[string]string)
+
+	// Populate keepMap with the service and endpoint information
+	c.ServiceMutex.Lock()
+	for _, serviceEndpoints := range c.ServiceMap {
+		if serviceEndpoints.Service != nil && serviceEndpoints.Endpoint != nil {
+			serviceIP := serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
+			endpointIP := serviceEndpoints.Endpoint.Subsets[0].Addresses[0].IP
+			keepMap[serviceIP] = endpointIP
+		}
+	}
+	c.ServiceMutex.Unlock()
+
+	// Call InitialCleanup with the populated map
+	if err := c.NAT.InitialCleanup(keepMap); err != nil {
+		return fmt.Errorf("failed to perform initial cleanup: %w", err)
+	}
+
 	return nil
 }

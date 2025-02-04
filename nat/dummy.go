@@ -19,7 +19,7 @@ func (d *DummyNATController) DeleteNAT(SvcIP, PodIP string) error {
 	return nil
 }
 
-func (d *DummyNATController) InitialCleanup(Keep map[string]string) error {
-	fmt.Println("InitialCleanup called with Keep:", Keep)
+func (d *DummyNATController) InitialCleanup(KeepMap map[string]string) error {
+	fmt.Println("InitialCleanup called with KeepMap:", KeepMap)
 	return nil
 }
