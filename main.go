@@ -7,6 +7,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"nat-controller/controllers"
+	"nat-controller/nat" // Add this import
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -63,9 +64,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	//nftConn := &nftables.Conn{}
-
-	controller := controllers.NewNATController(clientset)
+	// Use the DummyNATController instead of the current NATController
+	controller := &controllers.NATController{
+		Clientset: clientset,
+		NAT:       &nat.DummyNATController{}, // Add this line
+	}
 
 	if err := mgr.Add(controller); err != nil {
 		log.Error(err, "unable to add endpoints controller to manager")
