@@ -211,11 +211,12 @@ func (p *NFTNATProcessor) InitNAT() error {
 
 	// --- Add Rules ---
 	// In raw_prerouting: two rules are added in one call.
+
+	// Add rule for source addresses.
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
 		Chain: p.rawPrerouting,
 		Exprs: []expr.Any{
-			// Rule for source addresses: ip saddr @pod notrack return
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
@@ -229,8 +230,14 @@ func (p *NFTNATProcessor) InitNAT() error {
 			},
 			&expr.Notrack{},
 			&expr.Verdict{Kind: expr.VerdictReturn},
+		},
+	})
 
-			// Rule for destination addresses: ip daddr @svc notrack return
+	// Add rule for destination addresses.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.rawPrerouting,
+		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
