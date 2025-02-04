@@ -8,221 +8,264 @@ import (
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+var log = ctrl.Log.WithName("nat-processor")
 
 // NFTNATProcessor implements a NATProcessor using nftables.
 type NFTNATProcessor struct {
 	conn *nftables.Conn
 
-	// Raw table fields
-	rawTable      *nftables.Table
-	podsSet       *nftables.Set
-	svcsSet       *nftables.Set
-	preroutingRaw *nftables.Chain
+	// Table "wholeip" will contain all objects.
+	table *nftables.Table
 
-	// Route table fields
-	routeTable      *nftables.Table
-	snatMap         *nftables.Set // Maps pod IP -> svc IP
-	dnatMap         *nftables.Set // Maps svc IP -> pod IP
-	outputChain     *nftables.Chain
-	preroutingRoute *nftables.Chain
+	// Sets and maps.
+	podSet    *nftables.Set // Set "pod": contains pod IPs.
+	svcSet    *nftables.Set // Set "svc": contains service IPs.
+	podSvcMap *nftables.Set // Map "pod_svc": maps pod IP → svc IP.
+	svcPodMap *nftables.Set // Map "svc_pod": maps svc IP → pod IP.
+
+	// Chains.
+	rawPrerouting *nftables.Chain // Chain "raw_prerouting": for notrack rules.
+	natOutput     *nftables.Chain // Chain "nat_output": for SNAT rule.
+	natPrerouting *nftables.Chain // Chain "nat_prerouting": for DNAT rule.
 }
 
-// InitNAT loads the base configuration.
-// It flushes the existing ruleset, creates a raw table with sets and a prerouting chain
-// (and adds lookup rules for pods and services), then creates a route table with SNAT/DNAT maps,
-// output and prerouting chains, and adds SNAT/DNAT rules.
+// InitNAT initializes the nftables configuration in a single table "wholeip".
+// It flushes the entire ruleset, then re-creates the table with the desired sets, maps, and chains.
+// (If a previous table existed, its set elements are saved and then restored.)
 func (p *NFTNATProcessor) InitNAT() error {
-	// Create a new nftables connection.
-	var err error
-	p.conn, err = nftables.New()
-	if err != nil {
-		return fmt.Errorf("could not create nftables connection: %v", err)
+	log.Info("Initializing nftables NAT configuration")
+
+	// Create a new connection if needed.
+	if p.conn == nil {
+		var err error
+		p.conn, err = nftables.New()
+		if err != nil {
+			log.Error(err, "Could not create nftables connection")
+			return fmt.Errorf("could not create nftables connection: %v", err)
+		}
+		log.Info("Created nftables connection")
+	} else {
+		log.Info("Using existing nftables connection")
 	}
-	// Flush all existing rules.
+
+	// --- Save existing table "cozy_wholeip" if present ---
+	var savedPod, savedSvc, savedPodSvc, savedSvcPod []nftables.SetElement
+	tables, _ := p.conn.ListTables()
+	var existingTable *nftables.Table
+	for _, t := range tables {
+		if t.Family == nftables.TableFamilyIPv4 && t.Name == "cozy_wholeip" {
+			existingTable = t
+			break
+		}
+	}
+	if existingTable != nil {
+		log.Info("Found existing 'wholeip' table; saving set/map elements")
+		// Create dummy set objects for lookup.
+		dummyPod := &nftables.Set{Table: existingTable, Name: "pod", KeyType: nftables.TypeIPAddr}
+		dummySvc := &nftables.Set{Table: existingTable, Name: "svc", KeyType: nftables.TypeIPAddr}
+		dummyPodSvc := &nftables.Set{Table: existingTable, Name: "pod_svc", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeIPAddr, IsMap: true}
+		dummySvcPod := &nftables.Set{Table: existingTable, Name: "svc_pod", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeIPAddr, IsMap: true}
+		if elems, err := p.conn.GetSetElements(dummyPod); err == nil {
+			savedPod = elems
+		}
+		if elems, err := p.conn.GetSetElements(dummySvc); err == nil {
+			savedSvc = elems
+		}
+		if elems, err := p.conn.GetSetElements(dummyPodSvc); err == nil {
+			savedPodSvc = elems
+		}
+		if elems, err := p.conn.GetSetElements(dummySvcPod); err == nil {
+			savedSvcPod = elems
+		}
+	} else {
+		log.Info("No existing 'cozy_wholeip' table found; starting fresh")
+	}
+
+	// Flush the entire ruleset.
 	p.conn.FlushRuleset()
+	log.Info("Flushed entire ruleset")
 
-	// --- Raw Table Setup ---
-	p.rawTable = p.conn.AddTable(&nftables.Table{
+	// --- Create new table "cozy_wholeip" ---
+	p.table = p.conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv4,
-		Name:   "raw",
+		Name:   "cozy_wholeip",
 	})
+	log.Info("Created new table", "table", p.table.Name)
 
-	// Create the wholeip_pods set.
-	p.podsSet = &nftables.Set{
-		Table:   p.rawTable,
-		Name:    "wholeip_pods",
+	// --- Create Sets and Maps ---
+	// Set "pod": contains pod IP addresses.
+	p.podSet = &nftables.Set{
+		Table:   p.table,
+		Name:    "pod",
 		KeyType: nftables.TypeIPAddr,
 	}
-	if err := p.conn.AddSet(p.podsSet, nil); err != nil {
-		return fmt.Errorf("could not add pods set: %v", err)
+	if err := p.conn.AddSet(p.podSet, nil); err != nil {
+		log.Error(err, "Could not add pod set")
+		return fmt.Errorf("could not add pod set: %v", err)
 	}
-	// (Optional) Add a dummy pod IP element.
-	// Uncomment the following lines if you wish to preload a pod IP.
-	/*
-		podIP := net.ParseIP("10.244.0.24").To4()
-		if podIP == nil {
-			return fmt.Errorf("failed to parse dummy pod IP")
-		}
-		if err := p.conn.SetAddElements(p.podsSet, []nftables.SetElement{
-			{Key: podIP},
-		}); err != nil {
-			return fmt.Errorf("could not add dummy pod IP to set: %v", err)
-		}
-	*/
+	log.Info("Created pod set", "set", p.podSet.Name)
 
-	// Create the wholeip_svcs set.
-	p.svcsSet = &nftables.Set{
-		Table:   p.rawTable,
-		Name:    "wholeip_svcs",
+	// Set "svc": contains service IP addresses.
+	p.svcSet = &nftables.Set{
+		Table:   p.table,
+		Name:    "svc",
 		KeyType: nftables.TypeIPAddr,
 	}
-	if err := p.conn.AddSet(p.svcsSet, nil); err != nil {
-		return fmt.Errorf("could not add services set: %v", err)
+	if err := p.conn.AddSet(p.svcSet, nil); err != nil {
+		log.Error(err, "Could not add svc set")
+		return fmt.Errorf("could not add svc set: %v", err)
 	}
-	// (Optional) Add a dummy service IP element.
-	/*
-		svcIP := net.ParseIP("91.223.132.45").To4()
-		if svcIP == nil {
-			return fmt.Errorf("failed to parse dummy svc IP")
-		}
-		if err := p.conn.SetAddElements(p.svcsSet, []nftables.SetElement{
-			{Key: svcIP},
-		}); err != nil {
-			return fmt.Errorf("could not add dummy svc IP to set: %v", err)
-		}
-	*/
+	log.Info("Created svc set", "set", p.svcSet.Name)
 
-	// Create the prerouting chain in the raw table.
-	p.preroutingRaw = p.conn.AddChain(&nftables.Chain{
-		Name:     "prerouting",
-		Table:    p.rawTable,
+	// Map "pod_svc": maps pod IP → svc IP.
+	p.podSvcMap = &nftables.Set{
+		Table:    p.table,
+		Name:     "pod_svc",
+		KeyType:  nftables.TypeIPAddr,
+		DataType: nftables.TypeIPAddr,
+		IsMap:    true,
+	}
+	if err := p.conn.AddSet(p.podSvcMap, nil); err != nil {
+		log.Error(err, "Could not add pod_svc map")
+		return fmt.Errorf("could not add pod_svc map: %v", err)
+	}
+	log.Info("Created pod_svc map", "map", p.podSvcMap.Name)
+
+	// Map "svc_pod": maps svc IP → pod IP.
+	p.svcPodMap = &nftables.Set{
+		Table:    p.table,
+		Name:     "svc_pod",
+		KeyType:  nftables.TypeIPAddr,
+		DataType: nftables.TypeIPAddr,
+		IsMap:    true,
+	}
+	if err := p.conn.AddSet(p.svcPodMap, nil); err != nil {
+		log.Error(err, "Could not add svc_pod map")
+		return fmt.Errorf("could not add svc_pod map: %v", err)
+	}
+	log.Info("Created svc_pod map", "map", p.svcPodMap.Name)
+
+	// Restore saved elements, if any.
+	if len(savedPod) > 0 {
+		if err := p.conn.SetAddElements(p.podSet, savedPod); err != nil {
+			log.Error(err, "Failed to restore elements to pod set")
+			return fmt.Errorf("failed to restore elements to pod set: %v", err)
+		}
+		log.Info("Restored elements to pod set")
+	}
+	if len(savedSvc) > 0 {
+		if err := p.conn.SetAddElements(p.svcSet, savedSvc); err != nil {
+			log.Error(err, "Failed to restore elements to svc set")
+			return fmt.Errorf("failed to restore elements to svc set: %v", err)
+		}
+		log.Info("Restored elements to svc set")
+	}
+	if len(savedPodSvc) > 0 {
+		if err := p.conn.SetAddElements(p.podSvcMap, savedPodSvc); err != nil {
+			log.Error(err, "Failed to restore elements to pod_svc map")
+			return fmt.Errorf("failed to restore elements to pod_svc map: %v", err)
+		}
+		log.Info("Restored elements to pod_svc map")
+	}
+	if len(savedSvcPod) > 0 {
+		if err := p.conn.SetAddElements(p.svcPodMap, savedSvcPod); err != nil {
+			log.Error(err, "Failed to restore elements to svc_pod map")
+			return fmt.Errorf("failed to restore elements to svc_pod map: %v", err)
+		}
+		log.Info("Restored elements to svc_pod map")
+	}
+
+	// --- Create Chains ---
+	// Chain "raw_prerouting": hook prerouting, priority raw.
+	p.rawPrerouting = p.conn.AddChain(&nftables.Chain{
+		Name:     "raw_prerouting",
+		Table:    p.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookPrerouting,
 		Priority: nftables.ChainPriorityRaw,
 	})
+	log.Info("Created raw_prerouting chain", "chain", p.rawPrerouting.Name)
 
-	// Add a rule to the raw prerouting chain for source addresses.
+	// Chain "nat_output": hook postrouting, priority (srcnat + 1).
+	p.natOutput = p.conn.AddChain(&nftables.Chain{
+		Name:     "nat_output",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPostrouting,
+		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource + 1),
+	})
+	log.Info("Created nat_output chain", "chain", p.natOutput.Name)
+
+	// Chain "nat_prerouting": hook prerouting, priority (dstnat + 1).
+	p.natPrerouting = p.conn.AddChain(&nftables.Chain{
+		Name:     "nat_prerouting",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
+	})
+	log.Info("Created nat_prerouting chain", "chain", p.natPrerouting.Name)
+
+	// --- Add Rules ---
+	// In raw_prerouting: two rules are added in one call.
 	p.conn.AddRule(&nftables.Rule{
-		Table: p.rawTable,
-		Chain: p.preroutingRaw,
+		Table: p.table,
+		Chain: p.rawPrerouting,
 		Exprs: []expr.Any{
-			// Load source IP (offset 12 in the IP header).
+			// Rule for source addresses: ip saddr @pod notrack return
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
 				Offset:       12,
 				Len:          4,
 			},
-			// Lookup the source IP in the wholeip_pods set.
 			&expr.Lookup{
 				SourceRegister: 1,
-				SetName:        p.podsSet.Name,
-				SetID:          p.podsSet.ID,
+				SetName:        p.podSet.Name,
+				SetID:          p.podSet.ID,
 			},
-			// Do not track connection.
 			&expr.Notrack{},
-			// Return immediately.
-			&expr.Verdict{
-				Kind: expr.VerdictReturn,
-			},
-		},
-	})
+			&expr.Verdict{Kind: expr.VerdictReturn},
 
-	// Add a rule to the raw prerouting chain for destination addresses.
-	p.conn.AddRule(&nftables.Rule{
-		Table: p.rawTable,
-		Chain: p.preroutingRaw,
-		Exprs: []expr.Any{
-			// Load destination IP (offset 16 in the IP header).
+			// Rule for destination addresses: ip daddr @svc notrack return
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
 				Offset:       16,
 				Len:          4,
 			},
-			// Lookup the destination IP in the wholeip_svcs set.
 			&expr.Lookup{
 				SourceRegister: 1,
-				SetName:        p.svcsSet.Name,
-				SetID:          p.svcsSet.ID,
+				SetName:        p.svcSet.Name,
+				SetID:          p.svcSet.ID,
 			},
 			&expr.Notrack{},
-			&expr.Verdict{
-				Kind: expr.VerdictReturn,
-			},
+			&expr.Verdict{Kind: expr.VerdictReturn},
 		},
 	})
+	log.Info("Added rules to raw_prerouting chain")
 
-	// --- Route Table Setup ---
-	p.routeTable = p.conn.AddTable(&nftables.Table{
-		Family: nftables.TableFamilyIPv4,
-		Name:   "route",
-	})
-
-	// Create the wholeip_snat map (pod IP -> svc IP).
-	p.snatMap = &nftables.Set{
-		Table:    p.routeTable,
-		Name:     "wholeip_snat",
-		KeyType:  nftables.TypeIPAddr,
-		DataType: nftables.TypeIPAddr,
-		IsMap:    true,
-	}
-	if err := p.conn.AddSet(p.snatMap, nil); err != nil {
-		return fmt.Errorf("could not add SNAT map: %v", err)
-	}
-
-	// Create the wholeip_dnat map (svc IP -> pod IP).
-	p.dnatMap = &nftables.Set{
-		Table:    p.routeTable,
-		Name:     "wholeip_dnat",
-		KeyType:  nftables.TypeIPAddr,
-		DataType: nftables.TypeIPAddr,
-		IsMap:    true,
-	}
-	if err := p.conn.AddSet(p.dnatMap, nil); err != nil {
-		return fmt.Errorf("could not add DNAT map: %v", err)
-	}
-
-	// Create the output chain in the route table.
-	p.outputChain = p.conn.AddChain(&nftables.Chain{
-		Name:     "output",
-		Table:    p.routeTable,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPostrouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource + 1),
-	})
-
-	// Create the prerouting chain in the route table.
-	p.preroutingRoute = p.conn.AddChain(&nftables.Chain{
-		Name:     "prerouting",
-		Table:    p.routeTable,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
-	})
-
-	// Add the SNAT rule to the output chain.
+	// In nat_output: SNAT rule: ip saddr set ip saddr map @pod_svc
 	p.conn.AddRule(&nftables.Rule{
-		Table: p.routeTable,
-		Chain: p.outputChain,
+		Table: p.table,
+		Chain: p.natOutput,
 		Exprs: []expr.Any{
-			// Load source IP (offset 12).
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
 				Offset:       12,
 				Len:          4,
 			},
-			// Lookup in the SNAT map.
 			&expr.Lookup{
 				SourceRegister: 1,
 				DestRegister:   1,
-				SetName:        p.snatMap.Name,
-				SetID:          p.snatMap.ID,
+				SetName:        p.podSvcMap.Name,
+				SetID:          p.podSvcMap.ID,
 				IsDestRegSet:   true,
 			},
-			// Write the new source IP and update checksum.
 			&expr.Payload{
 				OperationType:  expr.PayloadWrite,
 				SourceRegister: 1,
@@ -235,28 +278,26 @@ func (p *NFTNATProcessor) InitNAT() error {
 			},
 		},
 	})
+	log.Info("Added SNAT rule to nat_output chain")
 
-	// Add the DNAT rule to the prerouting chain.
+	// In nat_prerouting: DNAT rule: ip daddr set ip daddr map @svc_pod
 	p.conn.AddRule(&nftables.Rule{
-		Table: p.routeTable,
-		Chain: p.preroutingRoute,
+		Table: p.table,
+		Chain: p.natPrerouting,
 		Exprs: []expr.Any{
-			// Load destination IP (offset 16).
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
 				Offset:       16,
 				Len:          4,
 			},
-			// Lookup in the DNAT map.
 			&expr.Lookup{
 				SourceRegister: 1,
 				DestRegister:   1,
-				SetName:        p.dnatMap.Name,
-				SetID:          p.dnatMap.ID,
+				SetName:        p.svcPodMap.Name,
+				SetID:          p.svcPodMap.ID,
 				IsDestRegSet:   true,
 			},
-			// Write the new destination IP and update checksum.
 			&expr.Payload{
 				OperationType:  expr.PayloadWrite,
 				SourceRegister: 1,
@@ -269,17 +310,26 @@ func (p *NFTNATProcessor) InitNAT() error {
 			},
 		},
 	})
+	log.Info("Added DNAT rule to nat_prerouting chain")
 
-	// Commit all the changes.
+	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit initial configuration")
 		return fmt.Errorf("failed to commit initial configuration: %v", err)
 	}
+	log.Info("Initial configuration committed successfully")
 	return nil
 }
 
-// EnsureNAT adds NAT mappings to the SNAT and DNAT maps and ensures the corresponding IPs
-// are present in the raw table sets. If a conflicting mapping exists, it returns an error.
+// EnsureNAT ensures that the mapping for svcIP and podIP exists.
+// In the pod_svc map (key: pod IP → svc IP) it checks if the given pod already maps to a svc.
+// If the pod is mapped to a different svc, a conflict is detected.
+// In the svc_pod map (key: svc IP → pod IP), if an entry exists with a different pod,
+// the old mapping is overridden.
+// The method also makes sure that the raw sets "pod" and "svc" include the given IPs.
 func (p *NFTNATProcessor) EnsureNAT(svcIP, podIP string) error {
+	log.Info("Ensuring NAT mapping", "svcIP", svcIP, "podIP", podIP)
+
 	parsedSvcIP := net.ParseIP(svcIP).To4()
 	if parsedSvcIP == nil {
 		return fmt.Errorf("invalid svcIP: %s", svcIP)
@@ -289,67 +339,94 @@ func (p *NFTNATProcessor) EnsureNAT(svcIP, podIP string) error {
 		return fmt.Errorf("invalid podIP: %s", podIP)
 	}
 
-	// Check for an existing mapping in the SNAT map.
-	snatElements, err := p.conn.GetSetElements(p.snatMap)
+	// Check pod_svc map: key=pod IP → value should be svcIP.
+	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
 	if err != nil {
-		return fmt.Errorf("failed to get SNAT map elements: %v", err)
+		log.Error(err, "Failed to get pod_svc map elements")
+		return fmt.Errorf("failed to get pod_svc map elements: %v", err)
 	}
-	for _, el := range snatElements {
+	for _, el := range podSvcElems {
 		if bytes.Equal(el.Key, parsedPodIP) {
 			if !bytes.Equal(el.Val, parsedSvcIP) {
+				log.Error(nil, "Mapping conflict in pod_svc: podIP already mapped to a different svcIP",
+					"podIP", podIP, "existingSvcIP", net.IP(el.Val).String())
 				return fmt.Errorf("conflict: podIP %s already mapped to a different svcIP", podIP)
 			}
 			// Mapping already exists.
-			return nil
+			goto SvcPodCheck
 		}
 	}
-
-	// Check for an existing mapping in the DNAT map.
-	dnatElements, err := p.conn.GetSetElements(p.dnatMap)
-	if err != nil {
-		return fmt.Errorf("failed to get DNAT map elements: %v", err)
-	}
-	for _, el := range dnatElements {
-		if bytes.Equal(el.Key, parsedSvcIP) {
-			if !bytes.Equal(el.Val, parsedPodIP) {
-				return fmt.Errorf("conflict: svcIP %s already mapped to a different podIP", svcIP)
-			}
-			return nil
-		}
-	}
-
-	// Add the mapping to SNAT and DNAT maps.
-	if err := p.conn.SetAddElements(p.snatMap, []nftables.SetElement{
+	// Add mapping {pod → svc} in pod_svc.
+	if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{
 		{Key: parsedPodIP, Val: parsedSvcIP},
 	}); err != nil {
-		return fmt.Errorf("failed to add SNAT mapping: %v", err)
+		log.Error(err, "Failed to add mapping to pod_svc", "podIP", podIP, "svcIP", svcIP)
+		return fmt.Errorf("failed to add mapping to pod_svc: %v", err)
 	}
-	if err := p.conn.SetAddElements(p.dnatMap, []nftables.SetElement{
-		{Key: parsedSvcIP, Val: parsedPodIP},
-	}); err != nil {
-		return fmt.Errorf("failed to add DNAT mapping: %v", err)
+	log.Info("Added mapping to pod_svc", "podIP", podIP, "svcIP", svcIP)
+
+SvcPodCheck:
+	// Check svc_pod map: key=svc IP → value should be podIP.
+	svcPodElems, err := p.conn.GetSetElements(p.svcPodMap)
+	if err != nil {
+		log.Error(err, "Failed to get svc_pod map elements")
+		return fmt.Errorf("failed to get svc_pod map elements: %v", err)
+	}
+	foundSvc := false
+	for _, el := range svcPodElems {
+		if bytes.Equal(el.Key, parsedSvcIP) {
+			foundSvc = true
+			if !bytes.Equal(el.Val, parsedPodIP) {
+				log.Info("Overriding svc_pod mapping for svcIP", "svcIP", svcIP, "oldPodIP", net.IP(el.Val).String(), "newPodIP", podIP)
+				// Delete the old mapping.
+				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: el.Val}}); err != nil {
+					log.Error(err, "Failed to delete old svc_pod mapping", "svcIP", svcIP, "oldPodIP", net.IP(el.Val).String())
+					return fmt.Errorf("failed to delete old svc_pod mapping: %v", err)
+				}
+				// Add the new mapping.
+				if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
+					log.Error(err, "Failed to add new svc_pod mapping", "svcIP", svcIP, "podIP", podIP)
+					return fmt.Errorf("failed to add new svc_pod mapping: %v", err)
+				}
+			}
+			break
+		}
+	}
+	if !foundSvc {
+		if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{
+			{Key: parsedSvcIP, Val: parsedPodIP},
+		}); err != nil {
+			log.Error(err, "Failed to add mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
+			return fmt.Errorf("failed to add mapping to svc_pod: %v", err)
+		}
+		log.Info("Added mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
 	}
 
-	// Also ensure that the raw table sets contain the pod and svc IPs.
-	if err := p.conn.SetAddElements(p.podsSet, []nftables.SetElement{
+	// Ensure the raw sets contain the IPs.
+	if err := p.conn.SetAddElements(p.podSet, []nftables.SetElement{
 		{Key: parsedPodIP},
 	}); err != nil {
-		return fmt.Errorf("failed to add pod IP to pods set: %v", err)
+		log.Error(err, "Failed to add pod IP to pod set", "podIP", podIP)
+		return fmt.Errorf("failed to add pod IP to pod set: %v", err)
 	}
-	if err := p.conn.SetAddElements(p.svcsSet, []nftables.SetElement{
+	if err := p.conn.SetAddElements(p.svcSet, []nftables.SetElement{
 		{Key: parsedSvcIP},
 	}); err != nil {
-		return fmt.Errorf("failed to add svc IP to svcs set: %v", err)
+		log.Error(err, "Failed to add svc IP to svc set", "svcIP", svcIP)
+		return fmt.Errorf("failed to add svc IP to svc set: %v", err)
 	}
 
 	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit EnsureNAT changes")
 		return fmt.Errorf("failed to commit EnsureNAT changes: %v", err)
 	}
+	log.Info("NAT mapping ensured successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
 }
 
-// DeleteNAT removes NAT mappings from the SNAT and DNAT maps.
+// DeleteNAT removes the mapping for the given svcIP and podIP from both maps.
 func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
+	log.Info("Deleting NAT mapping", "svcIP", svcIP, "podIP", podIP)
 	parsedSvcIP := net.ParseIP(svcIP).To4()
 	if parsedSvcIP == nil {
 		return fmt.Errorf("invalid svcIP: %s", svcIP)
@@ -359,52 +436,125 @@ func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
 		return fmt.Errorf("invalid podIP: %s", podIP)
 	}
 
-	if err := p.conn.SetDeleteElements(p.snatMap, []nftables.SetElement{
+	if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{
 		{Key: parsedPodIP, Val: parsedSvcIP},
 	}); err != nil {
-		return fmt.Errorf("failed to delete SNAT mapping: %v", err)
+		log.Error(err, "Failed to delete mapping from pod_svc", "podIP", podIP, "svcIP", svcIP)
+		return fmt.Errorf("failed to delete mapping from pod_svc: %v", err)
 	}
-	if err := p.conn.SetDeleteElements(p.dnatMap, []nftables.SetElement{
+	if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{
 		{Key: parsedSvcIP, Val: parsedPodIP},
 	}); err != nil {
-		return fmt.Errorf("failed to delete DNAT mapping: %v", err)
+		log.Error(err, "Failed to delete mapping from svc_pod", "svcIP", svcIP, "podIP", podIP)
+		return fmt.Errorf("failed to delete mapping from svc_pod: %v", err)
 	}
+
 	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit DeleteNAT changes")
 		return fmt.Errorf("failed to commit DeleteNAT changes: %v", err)
 	}
+	log.Info("NAT mapping deleted successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
 }
 
-// InitialCleanup receives a map (keepMap) where keys are svcIP and values are podIP.
-// It removes from the system all NAT mappings that do not exactly match an entry in keepMap.
+// InitialCleanup receives a keepMap (keys: svcIP, values: podIP) and removes all mappings
+// and raw set elements not matching an entry in keepMap.
 func (p *NFTNATProcessor) InitialCleanup(keepMap map[string]string) error {
-	dnatElements, err := p.conn.GetSetElements(p.dnatMap)
+	log.Info("Starting InitialCleanup", "keepMap", keepMap)
+
+	// --- Clean the maps ---
+	// Delete from pod_svc and svc_pod any mapping that is not in keepMap.
+	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
 	if err != nil {
-		return fmt.Errorf("failed to get DNAT map elements: %v", err)
+		log.Error(err, "Failed to get pod_svc elements")
+		return fmt.Errorf("failed to get pod_svc elements: %v", err)
 	}
-
-	var toDeleteDNAT []nftables.SetElement
-	var toDeleteSNAT []nftables.SetElement
-
-	for _, el := range dnatElements {
-		currentSvcIP := net.IP(el.Key).String()
-		currentPodIP := net.IP(el.Val).String()
-		if keepPodIP, exists := keepMap[currentSvcIP]; !exists || keepPodIP != currentPodIP {
-			toDeleteDNAT = append(toDeleteDNAT, nftables.SetElement{Key: el.Key, Val: el.Val})
-			toDeleteSNAT = append(toDeleteSNAT, nftables.SetElement{Key: el.Val, Val: el.Key})
-		}
-	}
-
-	if len(toDeleteDNAT) > 0 {
-		if err := p.conn.SetDeleteElements(p.dnatMap, toDeleteDNAT); err != nil {
-			return fmt.Errorf("failed to delete DNAT mappings during cleanup: %v", err)
-		}
-		if err := p.conn.SetDeleteElements(p.snatMap, toDeleteSNAT); err != nil {
-			return fmt.Errorf("failed to delete SNAT mappings during cleanup: %v", err)
-		}
-		if err := p.conn.Flush(); err != nil {
-			return fmt.Errorf("failed to commit InitialCleanup changes: %v", err)
+	var toDeletePodSvc []nftables.SetElement
+	var toDeleteSvcPod []nftables.SetElement
+	for _, el := range podSvcElems {
+		pod := net.IP(el.Key).String()
+		svc := net.IP(el.Val).String()
+		if expectedPod, exists := keepMap[svc]; !exists || expectedPod != pod {
+			log.Info("Marking mapping for deletion", "svcIP", svc, "podIP", pod)
+			toDeletePodSvc = append(toDeletePodSvc, nftables.SetElement{Key: el.Key, Val: el.Val})
+			toDeleteSvcPod = append(toDeleteSvcPod, nftables.SetElement{Key: el.Val, Val: el.Key})
 		}
 	}
+	if len(toDeletePodSvc) > 0 {
+		if err := p.conn.SetDeleteElements(p.podSvcMap, toDeletePodSvc); err != nil {
+			log.Error(err, "Failed to delete pod_svc mappings during cleanup")
+			return fmt.Errorf("failed to delete pod_svc mappings: %v", err)
+		}
+		if err := p.conn.SetDeleteElements(p.svcPodMap, toDeleteSvcPod); err != nil {
+			log.Error(err, "Failed to delete svc_pod mappings during cleanup")
+			return fmt.Errorf("failed to delete svc_pod mappings: %v", err)
+		}
+		log.Info("Map cleanup completed successfully")
+	} else {
+		log.Info("No map entries to cleanup")
+	}
+
+	// --- Clean the raw sets ---
+	// For the pod set: remove any pod IP not present in any keepMap value.
+	podSetElems, err := p.conn.GetSetElements(p.podSet)
+	if err != nil {
+		log.Error(err, "Failed to get pod set elements")
+		return fmt.Errorf("failed to get pod set elements: %v", err)
+	}
+	var toDeletePods []nftables.SetElement
+	for _, el := range podSetElems {
+		pod := net.IP(el.Key).String()
+		found := false
+		for _, keepPod := range keepMap {
+			if keepPod == pod {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Info("Marking pod IP for deletion from raw set", "podIP", pod)
+			toDeletePods = append(toDeletePods, nftables.SetElement{Key: el.Key})
+		}
+	}
+	if len(toDeletePods) > 0 {
+		if err := p.conn.SetDeleteElements(p.podSet, toDeletePods); err != nil {
+			log.Error(err, "Failed to delete pod IPs from pod set")
+			return fmt.Errorf("failed to delete pod IPs: %v", err)
+		}
+		log.Info("Pod set cleanup completed successfully")
+	} else {
+		log.Info("No pod IPs to delete from pod set")
+	}
+
+	// For the svc set: remove any svc IP not present as a key in keepMap.
+	svcSetElems, err := p.conn.GetSetElements(p.svcSet)
+	if err != nil {
+		log.Error(err, "Failed to get svc set elements")
+		return fmt.Errorf("failed to get svc set elements: %v", err)
+	}
+	var toDeleteSvcs []nftables.SetElement
+	for _, el := range svcSetElems {
+		svc := net.IP(el.Key).String()
+		if _, exists := keepMap[svc]; !exists {
+			log.Info("Marking svc IP for deletion from svc set", "svcIP", svc)
+			toDeleteSvcs = append(toDeleteSvcs, nftables.SetElement{Key: el.Key})
+		}
+	}
+	if len(toDeleteSvcs) > 0 {
+		if err := p.conn.SetDeleteElements(p.svcSet, toDeleteSvcs); err != nil {
+			log.Error(err, "Failed to delete svc IPs from svc set")
+			return fmt.Errorf("failed to delete svc IPs: %v", err)
+		}
+		log.Info("Svc set cleanup completed successfully")
+	} else {
+		log.Info("No svc IPs to delete from svc set")
+	}
+
+	// Final commit.
+	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit raw set cleanup changes")
+		return fmt.Errorf("failed to commit raw set cleanup changes: %v", err)
+	}
+	log.Info("InitialCleanup completed successfully")
 	return nil
 }
