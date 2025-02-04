@@ -65,10 +65,7 @@ func main() {
 
 	//nftConn := &nftables.Conn{}
 
-	controller := controllers.NATController{
-		Clientset: clientset,
-		//NFTConn:    nftConn,
-	}
+	controller := controllers.NewNATController(clientset)
 
 	if err := mgr.Add(controller); err != nil {
 		log.Error(err, "unable to add endpoints controller to manager")

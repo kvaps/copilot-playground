@@ -26,15 +26,53 @@ type ServiceEndpoints struct {
 }
 
 type NATController struct {
-	Clientset    *kubernetes.Clientset
-	ServiceMap   map[string]*ServiceEndpoints
-	ServiceMutex sync.Mutex
+	Clientset  *kubernetes.Clientset
+	ServiceMap *ServiceMap
 }
 
-func (c NATController) Start(ctx context.Context) error {
-	log.Info("starting nat-controller")
+type ServiceMap struct {
+	mu             sync.Mutex
+	serviceMapping map[string]*ServiceEndpoints
+}
 
-	c.ServiceMap = make(map[string]*ServiceEndpoints)
+func NewNATController(clientset *kubernetes.Clientset) *NATController {
+	return &NATController{
+		Clientset: clientset,
+		ServiceMap: &ServiceMap{
+			serviceMapping: make(map[string]*ServiceEndpoints),
+		},
+	}
+}
+
+func (sm *ServiceMap) Get(namespace, name string) (*ServiceEndpoints, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	se, exists := sm.serviceMapping[namespace+"/"+name]
+	return se, exists
+}
+
+func (sm *ServiceMap) Set(namespace, name string, se *ServiceEndpoints) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.serviceMapping[namespace+"/"+name] = se
+}
+
+func (sm *ServiceMap) Delete(namespace, name string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	delete(sm.serviceMapping, namespace+"/"+name)
+}
+
+func (sm *ServiceMap) SetEndpoint(namespace, name string, ep *v1.Endpoints) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if se, exists := sm.serviceMapping[namespace+"/"+name]; exists {
+		se.Endpoint = ep
+	}
+}
+
+func (c *NATController) Start(ctx context.Context) error {
+	log.Info("starting nat-controller")
 
 	// Create informer for services
 	serviceLW := cache.NewListWatchFromClient(c.Clientset.CoreV1().RESTClient(), "services", v1.NamespaceAll, fields.Everything())
@@ -128,8 +166,6 @@ func (c *NATController) addServiceFunc(obj interface{}) {
 	if !hasWholeIPAnnotation(svc) {
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
 
 	// Fetch the corresponding endpoint if it exists
 	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
@@ -148,12 +184,11 @@ func (c *NATController) addServiceFunc(obj interface{}) {
 
 	c.ensureRules(svc.Namespace, svc.Name, svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 
-	if _, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
+	if _, exists := c.ServiceMap.Get(svc.Namespace, svc.Name); exists {
 		// Service already added
 		return
 	}
-	c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
-	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+	c.ServiceMap.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
 }
 
 func (c *NATController) deleteServiceFunc(obj interface{}) {
@@ -162,9 +197,7 @@ func (c *NATController) deleteServiceFunc(obj interface{}) {
 		// object is not Service
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
-	se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]
+	se, exists := c.ServiceMap.Get(svc.Namespace, svc.Name)
 	if !exists {
 		// Service already deleted
 		return
@@ -175,7 +208,7 @@ func (c *NATController) deleteServiceFunc(obj interface{}) {
 	}
 
 	c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+	c.ServiceMap.Delete(svc.Namespace, svc.Name)
 }
 
 func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
@@ -184,15 +217,13 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 		// object is not Service
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
 	if !hasWholeIPAnnotation(svc) {
-		if se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
+		if se, exists := c.ServiceMap.Get(svc.Namespace, svc.Name); exists {
 			if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 				return
 			}
 			c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-			delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+			c.ServiceMap.Delete(svc.Namespace, svc.Name)
 			return
 		}
 	}
@@ -201,7 +232,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 		return
 	}
 
-	se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]
+	se, exists := c.ServiceMap.Get(svc.Namespace, svc.Name)
 
 	// Service have no IP
 	if !hasValidServiceIP(svc) {
@@ -209,7 +240,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 			return
 		}
 		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+		c.ServiceMap.Delete(svc.Namespace, svc.Name)
 		return
 	}
 
@@ -230,7 +261,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 			return
 		}
 		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+		c.ServiceMap.Delete(svc.Namespace, svc.Name)
 		return
 	}
 
@@ -239,9 +270,9 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 	if exists {
 		se.Service = svc
 	} else {
-		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+		c.ServiceMap.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
 	}
-	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+	c.ServiceMap.SetEndpoint(svc.Namespace, svc.Name, ep)
 }
 
 func (c *NATController) addEndpointFunc(obj interface{}) {
@@ -250,14 +281,10 @@ func (c *NATController) addEndpointFunc(obj interface{}) {
 		// object is not Endpoints
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
-	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	se, exists := c.ServiceMap.Get(ep.Namespace, ep.Name)
 	if !exists {
 		// Service is not managed by us
 		return
-	} else {
-		se.Endpoint = ep
 	}
 
 	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(ep) {
@@ -265,6 +292,7 @@ func (c *NATController) addEndpointFunc(obj interface{}) {
 	}
 
 	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.ServiceMap.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
 func (c *NATController) deleteEndpointFunc(obj interface{}) {
@@ -273,10 +301,8 @@ func (c *NATController) deleteEndpointFunc(obj interface{}) {
 		// object is not Endpoints
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
 
-	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	se, exists := c.ServiceMap.Get(ep.Namespace, ep.Name)
 	if !exists {
 		// service is not managed by us
 		return
@@ -287,7 +313,7 @@ func (c *NATController) deleteEndpointFunc(obj interface{}) {
 	}
 
 	c.deleteRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
+	c.ServiceMap.SetEndpoint(ep.Namespace, ep.Name, nil)
 }
 
 func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
@@ -296,9 +322,7 @@ func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 		// object is not Endpoints
 		return
 	}
-	c.ServiceMutex.Lock()
-	defer c.ServiceMutex.Unlock()
-	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	se, exists := c.ServiceMap.Get(ep.Namespace, ep.Name)
 	if !exists {
 		// service is not managed by us
 		return
@@ -309,7 +333,7 @@ func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 			return
 		}
 		c.deleteRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
-		se.Endpoint = ep
+		c.ServiceMap.SetEndpoint(ep.Namespace, ep.Name, ep)
 		return
 	}
 
@@ -320,7 +344,7 @@ func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 		return
 	}
 	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
-	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = ep
+	c.ServiceMap.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
 func hasValidServiceIP(svc *v1.Service) bool {
