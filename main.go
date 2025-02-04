@@ -65,7 +65,7 @@ func main() {
 
 	//nftConn := &nftables.Conn{}
 
-	controller := controllers.ServicesController{
+	controller := controllers.NATController{
 		Clientset: clientset,
 		//NFTConn:    nftConn,
 	}

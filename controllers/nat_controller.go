@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	log = ctrl.Log.WithName("svc-controller")
+	log = ctrl.Log.WithName("nat-controller")
 )
 
 type ServiceEndpoints struct {
@@ -25,14 +25,14 @@ type ServiceEndpoints struct {
 	Endpoint *v1.Endpoints
 }
 
-type ServicesController struct {
+type NATController struct {
 	Clientset    *kubernetes.Clientset
 	ServiceMap   map[string]*ServiceEndpoints
 	ServiceMutex sync.Mutex
 }
 
-func (c ServicesController) Start(ctx context.Context) error {
-	log.Info("starting services controller")
+func (c NATController) Start(ctx context.Context) error {
+	log.Info("starting nat-controller")
 
 	c.ServiceMap = make(map[string]*ServiceEndpoints)
 
@@ -114,18 +114,18 @@ func (c ServicesController) Start(ctx context.Context) error {
 	log.Info("cleanup of removed services completed")
 
 	<-ctx.Done()
-	log.Info("shutting down services controller")
+	log.Info("shutting down nat-controller")
 
 	return nil
 }
 
-func (c *ServicesController) addServiceFunc(obj interface{}) {
+func (c *NATController) addServiceFunc(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// object is not Service
 		return
 	}
-	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
+	if !hasWholeIPAnnotation(svc) {
 		return
 	}
 	c.ServiceMutex.Lock()
@@ -133,15 +133,16 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 
 	// Fetch the corresponding endpoint if it exists
 	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
-	if err != nil {
-		// TODO error
+	if err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "failed to get endpoints for service")
+		return
+	}
+	if ep == nil {
+		// Endpoint not found
 		return
 	}
 
-	if len(svc.Status.LoadBalancer.Ingress) == 0 || svc.Status.LoadBalancer.Ingress[0].IP == "" {
-		return
-	}
-	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidServiceIP(svc) || !hasValidEndpointIP(ep) {
 		return
 	}
 
@@ -155,7 +156,7 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
 }
 
-func (c *ServicesController) deleteServiceFunc(obj interface{}) {
+func (c *NATController) deleteServiceFunc(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -169,10 +170,7 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 		return
 	}
 
-	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-		return
-	}
-	if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 		return
 	}
 
@@ -180,7 +178,7 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
 }
 
-func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
+func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 	svc, ok := newObj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -188,12 +186,9 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
+	if !hasWholeIPAnnotation(svc) {
 		if se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
-			if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-				return
-			}
-			if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+			if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 				return
 			}
 			c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
@@ -202,18 +197,15 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 		}
 	}
 
-	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
+	if !hasWholeIPAnnotation(svc) {
 		return
 	}
 
 	se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]
 
 	// Service have no IP
-	if len(svc.Status.LoadBalancer.Ingress) == 0 || svc.Status.LoadBalancer.Ingress[0].IP == "" {
-		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-			return
-		}
-		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidServiceIP(svc) {
+		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 			return
 		}
 		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
@@ -224,25 +216,21 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	// Fetch the corresponding endpoint if it exists
 	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
 	if err != nil && !errors.IsNotFound(err) {
-		// TODO error
+		log.Error(err, "failed to get endpoints for service")
+		return
+	}
+	if ep == nil {
+		// Endpoint not found
 		return
 	}
 
 	// Endpoint have no IP
-	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
-		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-			return
-		}
-		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidEndpointIP(ep) {
+		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 			return
 		}
 		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
-		return
-	}
-
-	if ep == nil {
-		// TODO error
 		return
 	}
 
@@ -254,10 +242,9 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
 	}
 	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
-
 }
 
-func (c *ServicesController) addEndpointFunc(obj interface{}) {
+func (c *NATController) addEndpointFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -273,17 +260,14 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 		se.Endpoint = ep
 	}
 
-	if se.Service == nil || len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-		return
-	}
-	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(ep) {
 		return
 	}
 
 	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 }
 
-func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
+func (c *NATController) deleteEndpointFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -294,14 +278,11 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 
 	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
 	if !exists {
-		// Service is not managed by us
+		// service is not managed by us
 		return
 	}
 
-	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-		return
-	}
-	if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 		return
 	}
 
@@ -309,7 +290,7 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
 }
 
-func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
+func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 	ep, ok := newObj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -319,15 +300,12 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	defer c.ServiceMutex.Unlock()
 	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
 	if !exists {
-		// Service is not managed by us
+		// service is not managed by us
 		return
 	}
 
-	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
-		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
-			return
-		}
-		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidEndpointIP(ep) {
+		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 			return
 		}
 		c.deleteRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
@@ -335,26 +313,38 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 		return
 	}
 
-	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+	if !hasValidServiceIP(se.Service) {
 		return
 	}
-	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+	if !hasValidEndpointIP(ep) {
 		return
 	}
 	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = ep
 }
 
-// Placeholder for cleanupRemovedServices
-func (c *ServicesController) cleanupRemovedServices() error {
+func hasValidServiceIP(svc *v1.Service) bool {
+	return len(svc.Status.LoadBalancer.Ingress) > 0 && svc.Status.LoadBalancer.Ingress[0].IP != ""
+}
+
+func hasValidEndpointIP(ep *v1.Endpoints) bool {
+	return len(ep.Subsets) > 0 && len(ep.Subsets[0].Addresses) > 0 && ep.Subsets[0].Addresses[0].IP != ""
+}
+
+func hasWholeIPAnnotation(svc *v1.Service) bool {
+	val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]
+	return ok && val == "true"
+}
+
+func (c *NATController) cleanupRemovedServices() error {
 	// Placeholder logic for removing services not in the map
 	return nil
 }
 
-func (c *ServicesController) ensureRules(namespace, name, svcIP, epIP string) {
-	fmt.Println("ensure rules", namespace, name, svcIP, "-->", epIP)
+func (c *NATController) ensureRules(namespace, name, svcIP, podIP string) {
+	log.Info(fmt.Sprintf("ensure rules for %s/%s: %s --> %s", namespace, name, svcIP, podIP))
 }
 
-func (c *ServicesController) deleteRules(namespace, name, svcIP, epIP string) {
-	fmt.Println("delete rules", namespace, name, svcIP, "-->", epIP)
+func (c *NATController) deleteRules(namespace, name, svcIP, podIP string) {
+	log.Info(fmt.Sprintf("delete rules for %s/%s: %s --> %s", namespace, name, svcIP, podIP))
 }
