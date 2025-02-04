@@ -64,10 +64,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Use the DummyNATController instead of the current NATController
+	// Use the DummyNATProcessor instead of the current NATProcessor
 	controller := &controllers.NATController{
 		Clientset: clientset,
-		NAT:       &nat.DummyNATController{}, // Add this line
+		NAT:       &nat.DummyNATProcessor{}, // Add this line
 	}
 
 	if err := mgr.Add(controller); err != nil {

@@ -31,7 +31,7 @@ type NATController struct {
 	Clientset    *kubernetes.Clientset
 	ServiceMap   map[string]*ServiceEndpoints
 	ServiceMutex sync.Mutex
-	NAT          nat.NATController // Add this field
+	NAT          nat.NATProcessor // Add this field
 }
 
 func (c NATController) Start(ctx context.Context) error {
