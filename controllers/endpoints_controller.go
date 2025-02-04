@@ -7,6 +7,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -124,24 +125,34 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 		// object is not Service
 		return
 	}
-	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; ok && val == "true" {
-		c.ServiceMutex.Lock()
-		defer c.ServiceMutex.Unlock()
-		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
+		return
+	}
+	c.ServiceMutex.Lock()
+	defer c.ServiceMutex.Unlock()
 
-		// Fetch the corresponding endpoint if it exists
-		ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
-		if err == nil {
-			c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
-		}
+	// Fetch the corresponding endpoint if it exists
+	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+	if err != nil {
+		// TODO error
+		return
 	}
-	fmt.Println("add service", svc.GetNamespace(), svc.GetName())
-	// TODO
-	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
-		}
+
+	if len(svc.Status.LoadBalancer.Ingress) == 0 || svc.Status.LoadBalancer.Ingress[0].IP == "" {
+		return
 	}
+	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+		return
+	}
+
+	c.ensureRules(svc.Namespace, svc.Name, svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+
+	if _, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
+		// Service already added
+		return
+	}
+	c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
 }
 
 func (c *ServicesController) deleteServiceFunc(obj interface{}) {
@@ -152,14 +163,21 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
-	fmt.Println("delete service", svc.GetNamespace(), svc.GetName())
-	// TODO
-	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
-		}
+	se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]
+	if !exists {
+		// Service already deleted
+		return
 	}
+
+	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+		return
+	}
+	if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+		return
+	}
+
+	c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
 }
 
 func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
@@ -170,29 +188,73 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; ok && val == "true" {
+	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
 		if se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]; exists {
-			se.Service = svc
-		} else {
-			c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
-
-			// Fetch the corresponding endpoint if it exists
-			ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
-			if err == nil {
-				c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+			if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+				return
 			}
+			if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+				return
+			}
+			c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+			delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+			return
 		}
-	} else {
-		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
 	}
-	fmt.Println("update service", svc.GetNamespace(), svc.GetName())
 
-	// TODO
-	if sm, ok := c.ServiceMap[svc.Namespace+"/"+svc.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
-		}
+	if val, ok := svc.Annotations["networking.cozystack.io/wholeIP"]; !ok || val != "true" {
+		return
 	}
+
+	se, exists := c.ServiceMap[svc.Namespace+"/"+svc.Name]
+
+	// Service have no IP
+	if len(svc.Status.LoadBalancer.Ingress) == 0 || svc.Status.LoadBalancer.Ingress[0].IP == "" {
+		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+			return
+		}
+		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+			return
+		}
+		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+		return
+	}
+
+	// Fetch the corresponding endpoint if it exists
+	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		// TODO error
+		return
+	}
+
+	// Endpoint have no IP
+	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+			return
+		}
+		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+			return
+		}
+		c.deleteRules(svc.Namespace, svc.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+		delete(c.ServiceMap, svc.Namespace+"/"+svc.Name)
+		return
+	}
+
+	if ep == nil {
+		// TODO error
+		return
+	}
+
+	c.ensureRules(svc.Namespace, svc.Name, svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+
+	if exists {
+		se.Service = svc
+	} else {
+		c.ServiceMap[svc.Namespace+"/"+svc.Name] = &ServiceEndpoints{Service: svc}
+	}
+	c.ServiceMap[svc.Namespace+"/"+svc.Name].Endpoint = ep
+
 }
 
 func (c *ServicesController) addEndpointFunc(obj interface{}) {
@@ -203,18 +265,22 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	if se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
-		se.Endpoint = ep
+	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	if !exists {
+		// Service is not managed by us
+		return
 	} else {
-		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
+		se.Endpoint = ep
 	}
-	fmt.Println("add endpoint", ep.GetNamespace(), ep.GetName())
-	// TODO
-	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
-		}
+
+	if se.Service == nil || len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+		return
 	}
+	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+		return
+	}
+
+	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 }
 
 func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
@@ -225,16 +291,22 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	if _, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
-		c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
+
+	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	if !exists {
+		// Service is not managed by us
+		return
 	}
-	fmt.Println("delete endpoint", ep.GetNamespace(), ep.GetName())
-	// TODO
-	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
-		}
+
+	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+		return
 	}
+	if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+		return
+	}
+
+	c.deleteRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = nil
 }
 
 func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
@@ -245,22 +317,44 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	}
 	c.ServiceMutex.Lock()
 	defer c.ServiceMutex.Unlock()
-	if se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]; exists {
-		se.Endpoint = ep
-	} else {
-		c.ServiceMap[ep.Namespace+"/"+ep.Name] = &ServiceEndpoints{Endpoint: ep}
+	se, exists := c.ServiceMap[ep.Namespace+"/"+ep.Name]
+	if !exists {
+		// Service is not managed by us
+		return
 	}
-	fmt.Println("update endpoint", ep.GetNamespace(), ep.GetName())
-	// TODO
-	if sm, ok := c.ServiceMap[ep.Namespace+"/"+ep.Name]; ok && sm.Service != nil && sm.Endpoint != nil {
-		if len(sm.Service.Status.LoadBalancer.Ingress) > 0 && len(sm.Endpoint.Subsets) > 0 && len(sm.Endpoint.Subsets[0].Addresses) > 0 {
-			fmt.Println(sm.Service.Status.LoadBalancer.Ingress[0].IP, sm.Endpoint.Subsets[0].Addresses[0].IP)
+
+	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+		if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+			return
 		}
+		if len(se.Endpoint.Subsets) == 0 || len(se.Endpoint.Subsets[0].Addresses) == 0 || se.Endpoint.Subsets[0].Addresses[0].IP == "" {
+			return
+		}
+		c.deleteRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+		se.Endpoint = ep
+		return
 	}
+
+	if len(se.Service.Status.LoadBalancer.Ingress) == 0 || se.Service.Status.LoadBalancer.Ingress[0].IP == "" {
+		return
+	}
+	if len(ep.Subsets) == 0 || len(ep.Subsets[0].Addresses) == 0 || ep.Subsets[0].Addresses[0].IP == "" {
+		return
+	}
+	c.ensureRules(ep.Namespace, ep.Name, se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.ServiceMap[ep.Namespace+"/"+ep.Name].Endpoint = ep
 }
 
 // Placeholder for cleanupRemovedServices
 func (c *ServicesController) cleanupRemovedServices() error {
 	// Placeholder logic for removing services not in the map
 	return nil
+}
+
+func (c *ServicesController) ensureRules(namespace, name, svcIP, epIP string) {
+	fmt.Println("ensure rules", namespace, name, svcIP, "-->", epIP)
+}
+
+func (c *ServicesController) deleteRules(namespace, name, svcIP, epIP string) {
+	fmt.Println("delete rules", namespace, name, svcIP, "-->", epIP)
 }
