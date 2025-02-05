@@ -51,12 +51,12 @@ func (p *NFTNATProcessor) InitNAT() error {
 		log.Info("Using existing nftables connection")
 	}
 
-	// --- Save existing table "cozy_wholeip" if present ---
+	// --- Save existing table "cozy_proxy" if present ---
 	var savedPod, savedSvc, savedPodSvc, savedSvcPod []nftables.SetElement
 	tables, _ := p.conn.ListTables()
 	var existingTable *nftables.Table
 	for _, t := range tables {
-		if t.Family == nftables.TableFamilyIPv4 && t.Name == "cozy_wholeip" {
+		if t.Family == nftables.TableFamilyIPv4 && t.Name == "cozy_proxy" {
 			existingTable = t
 			break
 		}
@@ -81,17 +81,17 @@ func (p *NFTNATProcessor) InitNAT() error {
 			savedSvcPod = elems
 		}
 	} else {
-		log.Info("No existing 'cozy_wholeip' table found; starting fresh")
+		log.Info("No existing 'cozy_proxy' table found; starting fresh")
 	}
 
 	// Flush the entire ruleset.
 	p.conn.FlushRuleset()
 	log.Info("Flushed entire ruleset")
 
-	// --- Create new table "cozy_wholeip" ---
+	// --- Create new table "cozy_proxy" ---
 	p.table = p.conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv4,
-		Name:   "cozy_wholeip",
+		Name:   "cozy_proxy",
 	})
 	log.Info("Created new table", "table", p.table.Name)
 
@@ -431,7 +431,9 @@ SvcPodCheck:
 	return nil
 }
 
-// DeleteNAT removes the mapping for the given svcIP and podIP from both maps.
+// DeleteNAT removes the mapping for the given svcIP and podIP from both maps
+// and also deletes the corresponding IPs from the raw sets ("pod" and "svc").
+// This ensures that the raw_prerouting chain no longer matches these IPs.
 func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
 	log.Info("Deleting NAT mapping", "svcIP", svcIP, "podIP", podIP)
 	parsedSvcIP := net.ParseIP(svcIP).To4()
@@ -443,12 +445,15 @@ func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
 		return fmt.Errorf("invalid podIP: %s", podIP)
 	}
 
+	// Delete mapping from the "pod_svc" map.
 	if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{
 		{Key: parsedPodIP, Val: parsedSvcIP},
 	}); err != nil {
 		log.Error(err, "Failed to delete mapping from pod_svc", "podIP", podIP, "svcIP", svcIP)
 		return fmt.Errorf("failed to delete mapping from pod_svc: %v", err)
 	}
+
+	// Delete mapping from the "svc_pod" map.
 	if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{
 		{Key: parsedSvcIP, Val: parsedPodIP},
 	}); err != nil {
@@ -456,11 +461,28 @@ func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
 		return fmt.Errorf("failed to delete mapping from svc_pod: %v", err)
 	}
 
+	// Delete the pod IP from the "pod" set.
+	if err := p.conn.SetDeleteElements(p.podSet, []nftables.SetElement{
+		{Key: parsedPodIP},
+	}); err != nil {
+		log.Error(err, "Failed to delete pod IP from pod set", "podIP", podIP)
+		return fmt.Errorf("failed to delete pod IP from pod set: %v", err)
+	}
+
+	// Delete the svc IP from the "svc" set.
+	if err := p.conn.SetDeleteElements(p.svcSet, []nftables.SetElement{
+		{Key: parsedSvcIP},
+	}); err != nil {
+		log.Error(err, "Failed to delete svc IP from svc set", "svcIP", svcIP)
+		return fmt.Errorf("failed to delete svc IP from svc set: %v", err)
+	}
+
+	// Flush all changes.
 	if err := p.conn.Flush(); err != nil {
 		log.Error(err, "Failed to commit DeleteNAT changes")
 		return fmt.Errorf("failed to commit DeleteNAT changes: %v", err)
 	}
-	log.Info("NAT mapping deleted successfully", "svcIP", svcIP, "podIP", podIP)
+	log.Info("NAT mapping and raw set elements deleted successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
 }
 
