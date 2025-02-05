@@ -6,8 +6,8 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	"nat-controller/controllers"
-	"nat-controller/nat" // Add this import
+	"github.com/aenix-io/cozy-proxy/pkg/controllers"
+	"github.com/aenix-io/cozy-proxy/pkg/proxy"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -64,10 +64,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Use the DummyNATProcessor instead of the current NATProcessor
 	controller := &controllers.NATController{
 		Clientset: clientset,
-		NAT:       &nat.NFTNATProcessor{}, // Add this line
+		Proxy:     &proxy.NFTProxyProcessor{},
 	}
 
 	if err := mgr.Add(controller); err != nil {

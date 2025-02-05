@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"nat-controller/nat"
+	nat "github.com/aenix-io/cozy-proxy/pkg/proxy"
 )
 
 var (
@@ -96,7 +96,7 @@ func (sm *ServiceMap) GetAll() map[string]*ServiceEndpoints {
 type NATController struct {
 	Clientset *kubernetes.Clientset
 	Services  *ServiceMap
-	NAT       nat.NATProcessor
+	Proxy     nat.ProxyProcessor
 }
 
 // Start initializes the NAT, runs the service and endpoint informers, and cleans up removed services.
@@ -106,9 +106,9 @@ func (c *NATController) Start(ctx context.Context) error {
 	// Initialize the Services map.
 	c.Services = NewServiceMap()
 
-	// Initialize NAT.
-	if err := c.NAT.InitNAT(); err != nil {
-		return fmt.Errorf("failed to initialize NAT: %w", err)
+	// Initialize proxy rules.
+	if err := c.Proxy.InitRules(); err != nil {
+		return fmt.Errorf("failed to initialize Proxy processor: %w", err)
 	}
 
 	// Create informer for services.
@@ -230,7 +230,7 @@ func (c *NATController) addServiceFunc(obj interface{}) {
 	}
 
 	// Ensure NAT mapping.
-	c.NAT.EnsureNAT(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.Proxy.EnsureRules(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 
 	// Add the service if not already present.
 	if _, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
@@ -261,7 +261,7 @@ func (c *NATController) deleteServiceFunc(obj interface{}) {
 		return
 	}
 
-	c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 	c.Services.Delete(svc.Namespace, svc.Name)
 }
 
@@ -277,7 +277,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 	if !hasWholeIPAnnotation(svc) {
 		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-				c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+				c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
 		}
@@ -288,7 +288,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 	// If the service does not have a valid IP, delete it.
 	if !hasValidServiceIP(svc) {
 		if exists && hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 		}
 		c.Services.Delete(svc.Namespace, svc.Name)
 		return
@@ -306,14 +306,14 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 	}
 	if !hasValidEndpointIP(ep) {
 		if exists && hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 		}
 		c.Services.Delete(svc.Namespace, svc.Name)
 		return
 	}
 
 	// Ensure NAT mapping is up to date.
-	c.NAT.EnsureNAT(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.Proxy.EnsureRules(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 	if exists {
 		se.Service = svc
 		se.Endpoint = ep
@@ -341,7 +341,7 @@ func (c *NATController) addEndpointFunc(obj interface{}) {
 	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(ep) {
 		return
 	}
-	c.NAT.EnsureNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.Proxy.EnsureRules(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 }
 
 // deleteEndpointFunc handles endpoint deletions.
@@ -360,7 +360,7 @@ func (c *NATController) deleteEndpointFunc(obj interface{}) {
 	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 		return
 	}
-	c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 	// Set the endpoint to nil.
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, nil)
 }
@@ -380,7 +380,7 @@ func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 	}
 	if !hasValidEndpointIP(ep) {
 		if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.NAT.DeleteNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
 		}
 		c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 		return
@@ -391,7 +391,7 @@ func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
 	if !hasValidEndpointIP(ep) {
 		return
 	}
-	c.NAT.EnsureNAT(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	c.Proxy.EnsureRules(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
@@ -426,7 +426,7 @@ func (c *NATController) cleanupRemovedServices() error {
 		}
 	}
 	// Call InitialCleanup with the snapshot.
-	if err := c.NAT.InitialCleanup(keepMap); err != nil {
+	if err := c.Proxy.CleanupRules(keepMap); err != nil {
 		return fmt.Errorf("failed to perform initial cleanup: %w", err)
 	}
 	return nil

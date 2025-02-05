@@ -1,4 +1,4 @@
-package nat
+package proxy
 
 import (
 	"bytes"
@@ -13,8 +13,8 @@ import (
 
 var log = ctrl.Log.WithName("nat-processor")
 
-// NFTNATProcessor implements a NATProcessor using nftables.
-type NFTNATProcessor struct {
+// NFTProxyProcessor implements a NATProcessor using nftables.
+type NFTProxyProcessor struct {
 	conn *nftables.Conn
 
 	// Table "wholeip" will contain all objects.
@@ -32,10 +32,10 @@ type NFTNATProcessor struct {
 	natPrerouting *nftables.Chain // Chain "nat_prerouting": for DNAT rule.
 }
 
-// InitNAT initializes the nftables configuration in a single table "wholeip".
+// InitRules initializes the nftables configuration in a single table "wholeip".
 // It flushes the entire ruleset, then re-creates the table with the desired sets, maps, and chains.
 // (If a previous table existed, its set elements are saved and then restored.)
-func (p *NFTNATProcessor) InitNAT() error {
+func (p *NFTProxyProcessor) InitRules() error {
 	log.Info("Initializing nftables NAT configuration")
 
 	// Create a new connection if needed.
@@ -328,13 +328,13 @@ func (p *NFTNATProcessor) InitNAT() error {
 	return nil
 }
 
-// EnsureNAT ensures that the mapping for svcIP and podIP exists.
+// EnsureRules ensures that the mapping for svcIP and podIP exists.
 // In the pod_svc map (key: pod IP → svc IP) it checks if the given pod already maps to a svc.
 // If the pod is mapped to a different svc, a conflict is detected.
 // In the svc_pod map (key: svc IP → pod IP), if an entry exists with a different pod,
 // the old mapping is overridden.
 // The method also makes sure that the raw sets "pod" and "svc" include the given IPs.
-func (p *NFTNATProcessor) EnsureNAT(svcIP, podIP string) error {
+func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
 	log.Info("Ensuring NAT mapping", "svcIP", svcIP, "podIP", podIP)
 
 	parsedSvcIP := net.ParseIP(svcIP).To4()
@@ -431,10 +431,10 @@ SvcPodCheck:
 	return nil
 }
 
-// DeleteNAT removes the mapping for the given svcIP and podIP from both maps
+// DeleteRules removes the mapping for the given svcIP and podIP from both maps
 // and also deletes the corresponding IPs from the raw sets ("pod" and "svc").
 // This ensures that the raw_prerouting chain no longer matches these IPs.
-func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
+func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
 	log.Info("Deleting NAT mapping", "svcIP", svcIP, "podIP", podIP)
 	parsedSvcIP := net.ParseIP(svcIP).To4()
 	if parsedSvcIP == nil {
@@ -486,9 +486,9 @@ func (p *NFTNATProcessor) DeleteNAT(svcIP, podIP string) error {
 	return nil
 }
 
-// InitialCleanup receives a keepMap (keys: svcIP, values: podIP) and removes all mappings
+// CleanupRules receives a keepMap (keys: svcIP, values: podIP) and removes all mappings
 // and raw set elements not matching an entry in keepMap.
-func (p *NFTNATProcessor) InitialCleanup(keepMap map[string]string) error {
+func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 	log.Info("Starting InitialCleanup", "keepMap", keepMap)
 
 	// --- Clean the maps ---

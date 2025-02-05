@@ -1,10 +1,10 @@
-module nat-controller
+module github.com/aenix-io/cozy-proxy
 
 go 1.23.4
 
 require (
 	github.com/google/nftables v0.2.0
-	golang.org/x/sys v0.29.0
+	golang.org/x/sys v0.30.0
 	k8s.io/api v0.32.1
 	k8s.io/apimachinery v0.32.1
 	k8s.io/client-go v0.32.1
