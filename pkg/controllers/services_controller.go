@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	log = ctrl.Log.WithName("nat-controller")
+	log = ctrl.Log.WithName("services-controller")
 )
 
 // ServiceEndpoints holds the service and its endpoints.
@@ -92,16 +92,15 @@ func (sm *ServiceMap) GetAll() map[string]*ServiceEndpoints {
 	return copyMap
 }
 
-// NATController now uses a pointer to ServiceMap instead of embedding a mutex.
-type NATController struct {
+type ServicesController struct {
 	Clientset *kubernetes.Clientset
 	Services  *ServiceMap
 	Proxy     nat.ProxyProcessor
 }
 
 // Start initializes the NAT, runs the service and endpoint informers, and cleans up removed services.
-func (c *NATController) Start(ctx context.Context) error {
-	log.Info("starting nat-controller")
+func (c *ServicesController) Start(ctx context.Context) error {
+	log.Info("starting services-controller")
 
 	// Initialize the Services map.
 	c.Services = NewServiceMap()
@@ -199,13 +198,13 @@ func (c *NATController) Start(ctx context.Context) error {
 	log.Info("cleanup of removed services completed")
 
 	<-ctx.Done()
-	log.Info("shutting down nat-controller")
+	log.Info("shutting down services-controller")
 
 	return nil
 }
 
 // addServiceFunc handles the addition of a service.
-func (c *NATController) addServiceFunc(obj interface{}) {
+func (c *ServicesController) addServiceFunc(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -245,7 +244,7 @@ func (c *NATController) addServiceFunc(obj interface{}) {
 }
 
 // deleteServiceFunc handles the deletion of a service.
-func (c *NATController) deleteServiceFunc(obj interface{}) {
+func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -266,7 +265,7 @@ func (c *NATController) deleteServiceFunc(obj interface{}) {
 }
 
 // updateServiceFunc handles service updates.
-func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
+func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	svc, ok := newObj.(*v1.Service)
 	if !ok {
 		// object is not Service
@@ -324,7 +323,7 @@ func (c *NATController) updateServiceFunc(oldObj, newObj interface{}) {
 }
 
 // addEndpointFunc handles the addition of endpoints.
-func (c *NATController) addEndpointFunc(obj interface{}) {
+func (c *ServicesController) addEndpointFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -345,7 +344,7 @@ func (c *NATController) addEndpointFunc(obj interface{}) {
 }
 
 // deleteEndpointFunc handles endpoint deletions.
-func (c *NATController) deleteEndpointFunc(obj interface{}) {
+func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -366,7 +365,7 @@ func (c *NATController) deleteEndpointFunc(obj interface{}) {
 }
 
 // updateEndpointFunc handles updates to endpoints.
-func (c *NATController) updateEndpointFunc(oldObj, newObj interface{}) {
+func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	ep, ok := newObj.(*v1.Endpoints)
 	if !ok {
 		// object is not Endpoints
@@ -414,7 +413,7 @@ func hasWholeIPAnnotation(svc *v1.Service) bool {
 }
 
 // cleanupRemovedServices performs an initial cleanup for removed services.
-func (c *NATController) cleanupRemovedServices() error {
+func (c *ServicesController) cleanupRemovedServices() error {
 	keepMap := make(map[string]string)
 	// Get a snapshot of all managed services.
 	allServices := c.Services.GetAll()

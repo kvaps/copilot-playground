@@ -11,7 +11,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-var log = ctrl.Log.WithName("nat-processor")
+var log = ctrl.Log.WithName("nft-proxy-processor")
 
 // NFTProxyProcessor implements a NATProcessor using nftables.
 type NFTProxyProcessor struct {

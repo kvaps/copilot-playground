@@ -64,7 +64,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	controller := &controllers.NATController{
+	controller := &controllers.ServicesController{
 		Clientset: clientset,
 		Proxy:     &proxy.NFTProxyProcessor{},
 	}
